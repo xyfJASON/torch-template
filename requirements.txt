@@ -1,0 +1,8 @@
+torch
+torchvision
+omegaconf
+numpy
+Pillow
+matplotlib
+tensorboard
+wandb
