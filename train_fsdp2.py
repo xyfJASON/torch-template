@@ -5,26 +5,25 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 from omegaconf import OmegaConf
-from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.tensor import DTensor
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torchvision.datasets import MNIST
 from torchvision.utils import make_grid
 from torchvision.transforms.functional import to_pil_image
 
 from models.dit import DiT
-from models.unet import UNet
 from utils.tracker import Tracker
 from utils.logger import setup_logger
 from utils.data import get_data_iterator
 from utils.ema import EMA
 from utils.optimizer import get_param_groups
-from utils.checkpoint import Checkpointer
+from utils.checkpoint import FSDP2Checkpointer
 from utils.rng import seed_everything, seed_worker
 from utils.scheduler import (
     ConstantWarmupLR,
@@ -36,7 +35,6 @@ from utils.distributed import (
     cleanup,
     gather_tensor,
     get_rank,
-    get_local_rank,
     get_world_size,
     is_dist_avail_and_initialized,
     is_main_process,
@@ -86,7 +84,6 @@ def main():
     # SETUP DISTRIBUTED
     device = setup_distributed()
     rank = get_rank()
-    local_rank = get_local_rank()
     world_size = get_world_size()
 
     # CREATE EXPERIMENT DIRECTORY
@@ -188,21 +185,28 @@ def main():
     # BUILD MODEL AND EMA MODEL
     model_kwargs: dict = OmegaConf.to_container(conf.model)
     model_kwargs.pop("type", None)
-    if conf.model.type == "unet":
-        model = UNet(**model_kwargs).to(device)
-        ema_model = UNet(**model_kwargs).to(device)
-    elif conf.model.type == "dit":
-        model = DiT(**model_kwargs).to(device)
-        ema_model = DiT(**model_kwargs).to(device)
+    if conf.model.type == "dit":
+        model = DiT(**model_kwargs)
+        ema_model = DiT(**model_kwargs)
     else:
         raise ValueError(f"Unsupported model: {conf.model.type}")
     logger.info("=" * 19 + " Model Info " + "=" * 19)
     logger.info(f"Built model: {model.__class__.__name__}")
     logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # WRAP MODEL WITH DDP
-    if is_dist_avail_and_initialized():
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    # FULLY SHARD MODEL
+    fsdp_kwargs = {}
+    if mp_enabled:
+        fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+        )
+    for block in model.blocks:
+        fully_shard(block, **fsdp_kwargs)
+    fully_shard(model, **fsdp_kwargs)
+    for block in ema_model.blocks:
+        fully_shard(block, **fsdp_kwargs)
+    fully_shard(ema_model, **fsdp_kwargs)
 
     # BUILD EMA MANAGER AND COPY WEIGHTS
     ema = EMA(model, ema_model, **conf.ema)
@@ -261,7 +265,7 @@ def main():
     logger.info(f"Scheduler: {scheduler.__class__.__name__}")
 
     # PREPARE CHECKPOINTER
-    checkpointer = Checkpointer(
+    checkpointer = FSDP2Checkpointer(
         models={"unet": model, "unet_ema": ema_model},
         optimizers={"unet": optimizer},
         schedulers={"unet": scheduler},
@@ -305,21 +309,21 @@ def main():
             consumed_batches += 1
 
             # sync/no-sync gradients
-            should_sync = (grad_acc_index == grad_acc_steps - 1) or (not isinstance(model, DDP))
-            with nullcontext() if should_sync else model.no_sync():
-                # forward (within autocast context)
-                with torch.autocast(device.type, dtype=mp_dtype, enabled=mp_enabled):
-                    t = torch.rand(images.shape[0], device=device)
-                    t_broadcast = t.reshape(images.shape[0], *([1] * (images.ndim - 1)))
-                    noise = torch.randn_like(images)
-                    xt = (1. - t_broadcast) * images + t_broadcast * noise
-                    v_target = noise - images
-                    v_pred = model(xt, t)
-                    loss = F.mse_loss(v_pred, v_target)
-                # backward (loss divided by accumulation steps)
-                loss = loss / grad_acc_steps
-                accumulated_loss += loss.detach()
-                loss.backward()
+            should_sync = (grad_acc_index == grad_acc_steps - 1)
+            model.set_requires_gradient_sync(should_sync)
+            # forward (within autocast context)
+            with torch.autocast(device.type, dtype=mp_dtype, enabled=mp_enabled):
+                t = torch.rand(images.shape[0], device=device)
+                t_broadcast = t.reshape(images.shape[0], *([1] * (images.ndim - 1)))
+                noise = torch.randn_like(images)
+                xt = (1. - t_broadcast) * images + t_broadcast * noise
+                v_target = noise - images
+                v_pred = model(xt, t)
+                loss = F.mse_loss(v_pred, v_target)
+            # backward (loss divided by accumulation steps)
+            loss = loss / grad_acc_steps
+            accumulated_loss += loss.detach()
+            loss.backward()
 
         # update gradients
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -334,7 +338,8 @@ def main():
         # logging
         if global_step % conf.logging.every_steps == 0 or global_step == 1:
             mean_loss = reduce_tensor(accumulated_loss)
-            grad_norm = reduce_tensor(grad_norm)
+            if isinstance(grad_norm, DTensor):
+                grad_norm = grad_norm.full_tensor()
             lr = optimizer.param_groups[0]["lr"]
             elapsed = max(time.monotonic() - last_log_time, 1e-6)
             steps_per_second = (global_step - last_log_step) / elapsed
@@ -375,6 +380,7 @@ def main():
                 for t, t_prev in zip(timesteps[:-1], timesteps[1:]):
                     v_pred = ema_model(samples, t.repeat((num_samples, )))
                     samples = samples - v_pred * (t - t_prev)
+                ema_model.reshard()  # restore root ema parameters to DTensors
                 samples = torch.cat(gather_tensor(samples), dim=0)[:conf.sampling.num_samples]
                 samples = (samples.float().clamp(-1, 1).cpu() + 1) / 2
             columns = max(1, math.ceil(math.sqrt(conf.sampling.num_samples)))

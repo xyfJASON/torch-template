@@ -6,15 +6,24 @@ data:
   prefetch_factor: 2
 
 model:
-  in_channels: 1
-  base_channels: 32
+  type: dit
+  img_input_size: 28
+  img_patch_size: 2
+  img_in_channels: 1
+  hidden_dim: 256
+  depth: 8
+  num_heads: 4
+  mlp_ratio: 4.0
 
 ema:
-  decay: 0.999
+  decay: 0.9999
+  warmup: crowsonkb
+  inv_gamma: 1.0
+  power: 0.75
 
 training:
   max_steps: 10000
-  precision: fp32
+  precision: bf16
   global_batch_size: 256  # across GPUs and accumulation steps
   micro_batch_size: -1    # samples per GPU per forward pass
   gradient_clip: 1.0

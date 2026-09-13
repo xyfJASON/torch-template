@@ -2,6 +2,7 @@ torch
 torchvision
 omegaconf
 numpy
+einops
 Pillow
 matplotlib
 tensorboard
