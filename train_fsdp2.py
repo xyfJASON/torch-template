@@ -1,6 +1,5 @@
 import json
 import math
-import time
 import argparse
 from pathlib import Path
 from datetime import datetime
@@ -19,6 +18,7 @@ from torchvision.transforms.functional import to_pil_image
 
 from models.dit import DiT
 from utils.tracker import Tracker
+from utils.monitor import Monitor
 from utils.logger import setup_logger
 from utils.data import get_data_iterator
 from utils.ema import EMA
@@ -286,8 +286,7 @@ def main():
 
     # START TRAINING
     logger.info("Start training...")
-    last_log_time = time.monotonic()
-    last_log_step = global_step
+    monitor = Monitor(device, global_step=global_step)
     dataiter = get_data_iterator(
         dataloader=dataloader,
         datasampler=datasampler,
@@ -341,18 +340,16 @@ def main():
             if isinstance(grad_norm, DTensor):
                 grad_norm = grad_norm.full_tensor()
             lr = optimizer.param_groups[0]["lr"]
-            elapsed = max(time.monotonic() - last_log_time, 1e-6)
-            steps_per_second = (global_step - last_log_step) / elapsed
-            vram = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-            vram = reduce_tensor(torch.tensor(vram, device=device), op="max")
-            torch.cuda.reset_peak_memory_stats(device)
+            monitor_metrics = monitor.collect(global_step)
             logger.info(
                 f"step: {global_step}, "
                 f"loss: {mean_loss.item():.6f}, "
                 f"grad_norm: {grad_norm:.6f}, "
                 f"lr: {lr:.2e} | "
-                f"vram: {vram.item():.2f}GiB, "
-                f"training_speed: {steps_per_second:.2f} steps/s"
+                f"vram (allocated): {monitor_metrics['vram_allocated']:.2f}GiB, "
+                f"vram (reserved): {monitor_metrics['vram_reserved']:.2f}GiB, "
+                f"vram (nvml): {monitor_metrics['vram_nvml']:.2f}GiB, "
+                f"speed: {monitor_metrics['speed']:.2f} steps/s"
             )
             tracker.log(
                 prefix="Train",
@@ -360,13 +357,11 @@ def main():
                     "loss": mean_loss,
                     "grad_norm": grad_norm,
                     "lr": lr,
-                    "vram": vram,
-                    "training_speed": steps_per_second,
+                    **monitor_metrics,
                 },
                 step=global_step,
             )
-            last_log_time = time.monotonic()
-            last_log_step = global_step
+            monitor.reset(global_step)
         model.eval()
 
         # sampling

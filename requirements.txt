@@ -7,3 +7,4 @@ Pillow
 matplotlib
 tensorboard
 wandb
+nvidia-ml-py
