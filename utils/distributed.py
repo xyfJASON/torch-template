@@ -16,8 +16,12 @@ def setup_distributed():
             device = torch.device("cpu")
             dist.init_process_group(backend="gloo")
         dist.barrier()
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cpu")
     return device
 
 

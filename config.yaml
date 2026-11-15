@@ -6,7 +6,6 @@ data:
   prefetch_factor: 2
 
 model:
-  type: dit
   img_input_size: 28
   img_patch_size: 2
   img_in_channels: 1

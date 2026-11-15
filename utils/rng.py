@@ -33,6 +33,7 @@ def get_rng_state() -> dict:
         "numpy": (numpy_state[0], numpy_state[1].tolist(), *numpy_state[2:]),
         "torch_cpu": torch.get_rng_state(),
         "torch_cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+        "torch_mps": torch.mps.get_rng_state() if torch.backends.mps.is_available() else None,
     }
 
 
@@ -43,3 +44,5 @@ def set_rng_state(state: dict) -> None:
     torch.set_rng_state(state["torch_cpu"])
     if state["torch_cuda"] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state(state["torch_cuda"])
+    if state.get("torch_mps") is not None and torch.backends.mps.is_available():
+        torch.mps.set_rng_state(state["torch_mps"])

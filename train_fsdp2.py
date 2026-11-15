@@ -11,12 +11,13 @@ import torchvision.transforms as T
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.tensor import DTensor
+from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torchvision.datasets import MNIST
 from torchvision.utils import make_grid
 from torchvision.transforms.functional import to_pil_image
 
-from models.dit import DiT
+from model import DiT
 from utils.tracker import Tracker
 from utils.monitor import Monitor
 from utils.logger import setup_logger
@@ -115,7 +116,7 @@ def main():
     mp_enabled = precision == "bf16"
 
     # PRINT SETUP INFO
-    logger.info("=" * 19 + " System Info " + "=" * 18)
+    logger.info(" System Info ".center(50, "="))
     logger.info(f"Using device: {device}")
     logger.info(f"Seed: {args.seed}")
     logger.info(f"Experiment directory: {exp_dir}")
@@ -123,7 +124,7 @@ def main():
     logger.info(f"Distributed mode: {is_dist_avail_and_initialized()}")
     logger.info(f"Mixed precision (bf16): {mp_enabled}")
     if len(args.overrides) > 0:
-        logger.info("=" * 19 + " Config Info " + "=" * 18)
+        logger.info(" Config Info ".center(50, "="))
         for item in args.overrides:
             key, _ = item.split("=", 1)
             old_value = OmegaConf.select(conf_base, key)
@@ -165,15 +166,15 @@ def main():
         batch_size=micro_batch_size,
         sampler=datasampler,
         num_workers=int(conf.data.num_workers),
-        pin_memory=bool(conf.data.get("pin_memory", True)),
-        prefetch_factor=int(conf.data.get("prefetch_factor", 2)),
+        pin_memory=bool(conf.data.get("pin_memory", True)) and device.type == "cuda",
+        prefetch_factor=int(conf.data.get("prefetch_factor", 2)) if int(conf.data.num_workers) > 0 else None,
         drop_last=True,
         worker_init_fn=seed_worker,
         generator=torch.Generator().manual_seed(args.seed + rank),
     )
     if len(dataloader) == 0:
         raise ValueError("DataLoader is empty.")
-    logger.info("=" * 19 + " Data Info " + "=" * 20)
+    logger.info(" Data Info ".center(50, "="))
     logger.info(f"Size of dataset: {len(dataset)}")
     logger.info(f"Global batch size: {global_batch_size}")
     logger.info(f"Micro batch size: {micro_batch_size}")
@@ -184,18 +185,15 @@ def main():
 
     # BUILD MODEL AND EMA MODEL
     model_kwargs: dict = OmegaConf.to_container(conf.model)
-    model_kwargs.pop("type", None)
-    if conf.model.type == "dit":
-        model = DiT(**model_kwargs)
-        ema_model = DiT(**model_kwargs)
-    else:
-        raise ValueError(f"Unsupported model: {conf.model.type}")
-    logger.info("=" * 19 + " Model Info " + "=" * 19)
+    model = DiT(**model_kwargs)
+    ema_model = DiT(**model_kwargs)
+    logger.info(" Model Info ".center(50, "="))
     logger.info(f"Built model: {model.__class__.__name__}")
     logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # FULLY SHARD MODEL
-    fsdp_kwargs = {}
+    # build the mesh explicitly, otherwise FSDP2 defaults to the accelerator (e.g., MPS) even when training on CPU
+    fsdp_kwargs = {"mesh": init_device_mesh(device.type, (world_size, ))}
     if mp_enabled:
         fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
@@ -259,23 +257,23 @@ def main():
         )
     else:
         raise ValueError(f"Unsupported scheduler: {conf.scheduler.type}")
-    logger.info("=" * 15 + " Optimization Info " + "=" * 16)
+    logger.info(" Optimization Info ".center(50, "="))
     logger.info(f"Learning rate: {conf.optimizer.lr}")
     logger.info(f"Optimizer: {optimizer.__class__.__name__}")
     logger.info(f"Scheduler: {scheduler.__class__.__name__}")
 
     # PREPARE CHECKPOINTER
     checkpointer = FSDP2Checkpointer(
-        models={"unet": model, "unet_ema": ema_model},
-        optimizers={"unet": optimizer},
-        schedulers={"unet": scheduler},
+        models={"model": model, "model_ema": ema_model},
+        optimizers={"model": optimizer},
+        schedulers={"model": scheduler},
         stateful={"ema": ema},
     )
 
     # RESUME
     global_step = 0
     consumed_batches = 0
-    logger.info("=" * 17 + " Training Info " + "=" * 18)
+    logger.info(" Training Info ".center(50, "="))
     if args.resume is not None:
         resume_path = args.resume.expanduser().resolve()
         state = checkpointer.load(resume_path)
@@ -346,10 +344,7 @@ def main():
                 f"loss: {mean_loss.item():.6f}, "
                 f"grad_norm: {grad_norm:.6f}, "
                 f"lr: {lr:.2e} | "
-                f"vram (allocated): {monitor_metrics['vram_allocated']:.2f}GiB, "
-                f"vram (reserved): {monitor_metrics['vram_reserved']:.2f}GiB, "
-                f"vram (nvml): {monitor_metrics['vram_nvml']:.2f}GiB, "
-                f"speed: {monitor_metrics['speed']:.2f} steps/s"
+                f"{monitor.format(monitor_metrics)}"
             )
             tracker.log(
                 prefix="Train",
